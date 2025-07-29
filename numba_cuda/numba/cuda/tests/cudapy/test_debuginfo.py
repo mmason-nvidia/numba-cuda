@@ -1,11 +1,18 @@
+import inspect
 from numba.tests.support import override_config, captured_stdout
 from numba.cuda.testing import skip_on_cudasim
 from numba import cuda
 from numba.core import types
 from numba.cuda.testing import CUDATestCase
+from textwrap import dedent
+import math
 import itertools
 import re
 import unittest
+import warnings
+from numba.core.errors import NumbaDebugInfoWarning
+from numba.tests.support import ignore_internal_warnings
+import numpy as np
 
 
 @skip_on_cudasim("Simulator does not produce debug dumps")
@@ -783,6 +790,267 @@ class TestCudaDebugInfo(CUDATestCase):
 
         ir = foo.inspect_llvm()[sig]
         self.assertFileCheckMatches(ir, foo.__doc__)
+
+    def test_missing_source(self):
+        strsrc = """
+        def foo():
+            pass
+        """
+        l = dict()
+        exec(dedent(strsrc), {}, l)
+        foo = cuda.jit(debug=True)(l["foo"])
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", NumbaDebugInfoWarning)
+            ignore_internal_warnings()
+            foo[1, 1]()
+
+        self.assertEqual(len(w), 1)
+        found = w[0]
+        self.assertEqual(found.category, NumbaDebugInfoWarning)
+        msg = str(found.message)
+        # make sure the warning contains the right message
+        self.assertIn("Could not find source for function", msg)
+        # and refers to the offending function
+        self.assertIn(str(foo.py_func), msg)
+
+    def test_irregularly_indented_source(self):
+        @cuda.jit(tuple(), debug=True)
+        def foo():
+            # TODO: figure out how to force incorrect indentation of this comment...
+            # fmt: off
+            # NOTE: THIS COMMENT MUST START AT COLUMN 0 FOR THIS SAMPLE CODE TO BE VALID # noqa
+            # fmt: on
+            pass
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", NumbaDebugInfoWarning)
+            ignore_internal_warnings()
+            foo[1, 1]()
+
+        # No warnings
+        self.assertEqual(len(w), 0)
+
+        self.assertFileCheckMatches(
+            foo.inspect_llvm()[tuple()],
+            """
+            CHECK: !DILocation(
+            CHECK-NOT: DILocation
+            """,
+        )
+
+    def test_no_if_op_bools_declared(self):
+        @cuda.jit(
+            "int64(boolean, boolean)",
+            debug=True,
+            _dbg_optnone=True,
+            device=True,
+        )
+        def choice(cond1, cond2):
+            """
+            CHECK: define void @{{.+}}choices
+            """
+            if cond1 and cond2:
+                return 1
+            else:
+                return 2
+
+        ir_content = choice.inspect_llvm()[choice.signatures[0]]
+        # We should not declare variables used as the condition in if ops.
+        # See Numba PR #9888: https://github.com/numba/numba/pull/9888
+
+        for line in ir_content.splitlines():
+            if "llvm.dbg.declare" in line:
+                self.assertNotIn("bool", line)
+
+    def test_llvm_inliner_flag_conflict(self):
+        # bar will be marked as 'alwaysinline', but when DEBUGINFO_DEFAULT is
+        # set functions are marked as 'noinline' this results in a conflict.
+        # baz will be marked as 'noinline' as a result of DEBUGINFO_DEFAULT
+
+        @cuda.jit(forceinline=True)
+        def bar(x):
+            return math.sin(x)
+
+        @cuda.jit(forceinline=False)
+        def baz(x):
+            return math.cos(x)
+
+        @cuda.jit(opt=True)
+        def foo(x, y):
+            """
+            CHECK-LABEL: define void @{{.+}}foo
+            CHECK: call i32 @"[[BAR:.+]]"(
+            CHECK: call i32 @"[[BAZ:.+]]"(
+
+            CHECK-DAG: declare i32 @"[[BAR]]"({{.+}}alwaysinline
+            CHECK-DAG: declare i32 @"[[BAZ]]"(
+            CHECK-NOT: alwaysinline
+
+            CHECK-DAG: define linkonce_odr i32 @"[[BAR]]"({{.+}}alwaysinline
+            CHECK-DAG: define linkonce_odr i32 @"[[BAZ]]"(
+            CHECK-NOT: alwaysinline
+            """
+            a = bar(y)
+            b = baz(y)
+            x[0] = a + b
+
+        # check it compiles
+        with override_config("DEBUGINFO_DEFAULT", 1):
+            result = cuda.device_array(1, dtype=np.float32)
+            foo[1, 1](result, np.pi)
+            result.copy_to_host()
+
+        result_host = math.sin(np.pi) + math.cos(np.pi)
+        self.assertPreciseEqual(result[0], result_host)
+
+        ir_content = foo.inspect_llvm()[foo.signatures[0]]
+        self.assertFileCheckMatches(ir_content, foo.__doc__)
+
+    def test_DILocation_versioned_variables(self):
+        """Tests that DILocation information for versions of variables matches
+        up to their definition site."""
+
+        @cuda.jit(debug=True)
+        def foo(dest, n):
+            """
+            CHECK: define void @{{.+}}foo
+            CHECK: store i64 5, i64* %"c{{.+}} !dbg ![[STORE5:.+]]
+            CHECK: store i64 1, i64* %"c{{.+}} !dbg ![[STORE1:.+]]
+            CHECK: [[STORE5]] = !DILocation(
+            CHECK: [[STORE1]] = !DILocation(
+            """
+            if n:
+                c = 5
+            else:
+                c = 1
+            dest[0] = c
+
+        result = cuda.device_array(1, dtype=np.int32)
+        foo[1, 1](result, 1)
+        result.copy_to_host()
+        self.assertEqual(result[0], 5)
+
+        ir_content = foo.inspect_llvm()[foo.signatures[0]]
+        self.assertFileCheckMatches(ir_content, foo.__doc__)
+
+        associated_lines = set()
+        di_local_variables = list(
+            filter(
+                lambda x: "!DILocalVariable" in x and 'name: "c"' in x,
+                ir_content.splitlines(),
+            )
+        )
+        line_number_regex = re.compile(r"line: ([0-9]+)")
+        for di_local_variable in di_local_variables:
+            match = line_number_regex.search(di_local_variable)
+            if match:
+                groups = match.groups()
+                self.assertEqual(len(groups), 1)
+                associated_lines.add(int(groups[0]))
+
+        # NOTE: Upstream has two line numbers associated with assignments to c,
+        # but we only have one.
+        self.assertEqual(len(associated_lines), 1)
+
+        pysrc, pysrc_line_start = inspect.getsourcelines(foo)
+        pysrc_with_line_numbers = list(
+            map(lambda x: (x[0] + pysrc_line_start, x[1]), enumerate(pysrc))
+        )
+        pysrc_assign_to_c = list(
+            filter(lambda x: "c = " in x[1], pysrc_with_line_numbers)
+        )
+        first_assign_to_c = pysrc_assign_to_c[0]
+
+        # The first assignment to c is the one that should be associated with
+        # the DILocalVariables.
+        self.assertEqual(first_assign_to_c[0], associated_lines.pop())
+
+    def test_debuginfo_asm(self):
+        def foo():
+            pass
+
+        foo_debug = cuda.jit(debug=True)(foo)
+        foo_debug[1, 1]()
+        asm = foo_debug.inspect_asm()[foo_debug.signatures[0]]
+        self.assertFileCheckMatches(
+            asm,
+            """
+            CHECK: .section{{.+}}.debug
+        """,
+        )
+
+        foo_nodebug = cuda.jit(debug=False)(foo)
+        foo_nodebug[1, 1]()
+        asm = foo_nodebug.inspect_asm()[foo_nodebug.signatures[0]]
+        self.assertFileCheckMatches(
+            asm,
+            """
+            CHECK-NOT: .section{{.+}}.debug
+        """,
+        )
+
+    def test_nrt_debuginfo(self):
+        with override_config("CUDA_ENABLE_NRT", True):
+
+            @cuda.jit
+            def f(x):
+                return x[:5]
+
+            @cuda.jit
+            def g():
+                x = np.empty(10, np.int64)
+                f(x)
+
+            g[1, 1]()
+
+            checks = (
+                """
+            CHECK: call void @"NRT_decref"(i8* %"{{.*}}.meminfo.{{[0-9]+}}")
+            CHECK-NOT: !dbg
+            """
+                * 5
+            )
+
+            ir_content = g.inspect_llvm()[g.signatures[0]]
+            self.assertFileCheckMatches(ir_content, checks)
+
+    def test_nrt_debuginfo_refcount(self):
+        with override_config("CUDA_ENABLE_NRT", True):
+
+            @cuda.jit(debug=True, opt=0)
+            def sink(x):
+                pass
+
+            @cuda.jit(
+                (types.float64[::1], types.float64[::1]), debug=True, opt=0
+            )
+            def foo(ret, a):
+                x = (a, a)
+                if a[0] == 0:
+                    sink(x)
+                    ret[0] = 12
+                z = x[0][0]
+                ret[0] = z
+
+            checks = """
+            CHECK: define linkonce_odr i32 @{{.+}}sink
+
+            CHECK: call void @"NRT_incref"(i8* %"{{.*}}.meminfo{{.*}}")
+            CHECK-NOT: !dbg
+            CHECK-NEXT: call void @"NRT_incref"(i8* %"{{.*}}.meminfo{{.*}}")
+            CHECK-NOT: !dbg
+            CHECK-NEXT: store
+
+            CHECK: call void @"NRT_decref"(i8* %"{{.*}}.meminfo{{.*}}")
+            CHECK-NOT: !dbg
+            CHECK-NEXT: call void @"NRT_decref"(i8* %"{{.*}}.meminfo{{.*}}")
+            CHECK-NOT: !dbg
+            CHECK-NEXT: store
+            """
+
+            ir_content = foo.inspect_llvm()[foo.signatures[0]]
+            self.assertFileCheckMatches(ir_content, checks)
 
 
 if __name__ == "__main__":
