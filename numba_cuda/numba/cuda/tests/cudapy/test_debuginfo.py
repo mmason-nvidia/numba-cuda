@@ -878,24 +878,38 @@ class TestCudaDebugInfo(CUDATestCase):
 
         @cuda.jit(opt=True)
         def foo(x, y):
-            """
-            CHECK-LABEL: define void @{{.+}}foo
-            CHECK: call i32 @"[[BAR:.+]]"(
-            CHECK: call i32 @"[[BAZ:.+]]"(
-
-            CHECK-DAG: declare i32 @"[[BAR]]"({{.+}}alwaysinline
-            CHECK-DAG: declare i32 @"[[BAZ]]"(
-            CHECK-NOT: alwaysinline
-
-            CHECK-DAG: define linkonce_odr i32 @"[[BAR]]"({{.+}}alwaysinline
-            CHECK-DAG: define linkonce_odr i32 @"[[BAZ]]"(
-            CHECK-NOT: alwaysinline
-            """
             a = bar(y)
             b = baz(y)
             x[0] = a + b
 
-        # check it compiles
+        # It is difficult to get the order of checks for bar and baz right -
+        # break this up into two checks, ensuring that:
+        # 1. bar has alwaysinline and calls __nv_sin
+        # 2. baz does not have alwaysinline and calls __nv_cos
+
+        foo_check = """
+            CHECK-LABEL: define void @{{.+}}foo
+            CHECK: call i32 @"[[BAR:.+]]"(
+            CHECK: call i32 @"[[BAZ:.+]]"(
+        """
+
+        bar_check = """
+            CHECK: declare i32 @"[[BAR]]"({{.+}}alwaysinline
+            CHECK: define linkonce_odr i32 @"[[BAR]]"({{.+}}alwaysinline
+            CHECK-NOT: ret i32
+            CHECK: call{{.+}}__nv_sin
+            CHECK: ret i32
+        """
+
+        baz_check = """
+            CHECK: declare i32 @"[[BAZ]]"
+            CHECK: define linkonce_odr i32 @"[[BAZ]]"
+            CHECK-NOT: alwaysinline
+            CHECK-NOT: ret i32
+            CHECK: call{{.+}}__nv_cos
+            CHECK: ret i32
+        """
+
         with override_config("DEBUGINFO_DEFAULT", 1):
             result = cuda.device_array(1, dtype=np.float32)
             foo[1, 1](result, np.pi)
@@ -905,7 +919,8 @@ class TestCudaDebugInfo(CUDATestCase):
         self.assertPreciseEqual(result[0], result_host)
 
         ir_content = foo.inspect_llvm()[foo.signatures[0]]
-        self.assertFileCheckMatches(ir_content, foo.__doc__)
+        self.assertFileCheckMatches(ir_content, foo_check + bar_check)
+        self.assertFileCheckMatches(ir_content, foo_check + baz_check)
 
     def test_DILocation_versioned_variables(self):
         """Tests that DILocation information for versions of variables matches
